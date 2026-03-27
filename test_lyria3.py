@@ -17,12 +17,16 @@ import argparse
 import base64
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+import librosa
+import numpy as np
 from google import genai
 
 load_dotenv()
@@ -45,9 +49,31 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # Rate limit: 10 QPM → 每次呼叫後等 7 秒保守避免觸發
 RATE_LIMIT_DELAY = 7
 
+# BPM 偵測容許偏差百分比
+BPM_TOLERANCE_PERCENT = 10
+
+# API 空回應時的最大重試次數
+MAX_RETRIES = 2
+
+
+def create_with_retry(model: str, input_data, retries: int = MAX_RETRIES):
+    """呼叫 interactions.create，遇到空回應時自動重試。"""
+    for attempt in range(1, retries + 2):
+        interaction = client.interactions.create(model=model, input=input_data)
+        if interaction.outputs:
+            return interaction
+        if attempt <= retries:
+            print(f"  [RETRY] 第 {attempt} 次空回應，{RATE_LIMIT_DELAY}s 後重試...")
+            time.sleep(RATE_LIMIT_DELAY)
+    return interaction  # 最後一次仍為空也回傳
+
 
 def save_interaction(interaction, test_name: str) -> list[str]:
     """儲存 interaction 的音檔與文字輸出，回傳儲存的檔案路徑列表。"""
+    if not interaction.outputs:
+        print("  [WARNING] interaction.outputs 為空（API preview 暫時性問題）")
+        return []
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     saved_files = []
 
@@ -74,6 +100,60 @@ def save_interaction(interaction, test_name: str) -> list[str]:
             print(f"  [AUDIO] {audio_file} ({size_kb:.1f} KB)")
 
     return saved_files
+
+
+def detect_bpm(audio_path: str) -> float | None:
+    """透過 ffmpeg 解碼 + librosa 分析，偵測音檔的 BPM。
+
+    流程：
+      1. 用 ffmpeg 將 MP3 轉為 WAV（PCM 16-bit, 22050 Hz, mono）
+      2. 用 librosa 載入 WAV 並以 beat_track 偵測 BPM
+
+    Args:
+        audio_path: MP3 音檔的路徑
+
+    Returns:
+        偵測到的 BPM 值，失敗時回傳 None
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_wav = tmp.name
+
+        # 用 ffmpeg 將 MP3 轉為 WAV（22050 Hz mono，適合 librosa 分析）
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ar", "22050", "-ac", "1", "-sample_fmt", "s16",
+            tmp_wav,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"  [BPM 分析] ffmpeg 轉檔失敗: {result.stderr[:200]}")
+            return None
+
+        # 用 librosa 載入並偵測 BPM
+        y, sr = librosa.load(tmp_wav, sr=22050)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+
+        # librosa 可能回傳 ndarray，取第一個值
+        if isinstance(tempo, np.ndarray):
+            tempo = float(tempo[0])
+        else:
+            tempo = float(tempo)
+
+        return round(tempo, 1)
+
+    except FileNotFoundError:
+        print("  [BPM 分析] 找不到 ffmpeg，請先安裝: brew install ffmpeg")
+        return None
+    except Exception as e:
+        print(f"  [BPM 分析] 偵測失敗: {e}")
+        return None
+    finally:
+        # 清理暫存檔
+        if os.path.exists(tmp_wav):
+            os.unlink(tmp_wav)
 
 
 def test_bpm_accuracy():
@@ -123,24 +203,73 @@ def test_bpm_accuracy():
         print(f"  Prompt: {item['prompt'][:80]}...")
 
         try:
-            interaction = client.interactions.create(
-                model=MODEL_PRO,
-                input=item["prompt"],
-            )
+            interaction = create_with_retry(MODEL_PRO, item["prompt"])
             files = save_interaction(interaction, f"bpm_{item['bpm']}")
-            results.append({"bpm": item["bpm"], "status": "OK", "files": files})
+
+            # 自動偵測 BPM 並比對
+            mp3_files = [f for f in files if f.endswith(".mp3")]
+            detected_bpm = None
+            bpm_verdict = "N/A"
+
+            if mp3_files:
+                detected_bpm = detect_bpm(mp3_files[0])
+                if detected_bpm is not None:
+                    target = item["bpm"]
+                    # 嘗試原始值、半頻、倍頻，取最接近目標的
+                    candidates = [detected_bpm, detected_bpm / 2, detected_bpm * 2]
+                    best = min(candidates, key=lambda c: abs(c - target))
+                    deviation = ((best - target) / target) * 100
+                    is_pass = abs(deviation) <= BPM_TOLERANCE_PERCENT
+                    bpm_verdict = "PASS" if is_pass else "FAIL"
+                    note = ""
+                    if best != detected_bpm:
+                        note = f" (原始偵測: {detected_bpm}, 修正為半頻/倍頻)"
+                    print(
+                        f"  [BPM 分析] BPM: {best:.1f} | "
+                        f"目標: {target} | "
+                        f"偏差: {deviation:+.1f}% | "
+                        f"{bpm_verdict}{note}"
+                    )
+                else:
+                    bpm_verdict = "ANALYSIS_ERROR"
+
+            results.append({
+                "bpm": item["bpm"],
+                "detected_bpm": best if detected_bpm is not None else None,
+                "verdict": bpm_verdict,
+                "status": "OK",
+                "files": files,
+            })
         except Exception as e:
             print(f"  [ERROR] {e}")
-            results.append({"bpm": item["bpm"], "status": f"FAIL: {e}", "files": []})
+            results.append({
+                "bpm": item["bpm"],
+                "detected_bpm": None,
+                "verdict": "API_ERROR",
+                "status": f"FAIL: {e}",
+                "files": [],
+            })
 
         if i < len(bpm_prompts):
             print(f"  (等待 {RATE_LIMIT_DELAY} 秒避免 rate limit...)")
             time.sleep(RATE_LIMIT_DELAY)
 
     print("\n--- BPM 測試結果摘要 ---")
+    print(f"  容許偏差範圍: ±{BPM_TOLERANCE_PERCENT}%")
     for r in results:
-        print(f"  BPM {r['bpm']}: {r['status']}")
-    print("  提醒：請人工聽音檔驗證實際 BPM 是否接近目標值")
+        if r["detected_bpm"] is not None:
+            target = r["bpm"]
+            deviation = ((r["detected_bpm"] - target) / target) * 100
+            print(
+                f"  BPM {r['bpm']:>3d} → 偵測: {r['detected_bpm']:>5.1f} "
+                f"| 偏差: {deviation:>+6.1f}% | {r['verdict']}"
+            )
+        else:
+            print(f"  BPM {r['bpm']:>3d} → {r['verdict']}")
+
+    pass_count = sum(1 for r in results if r["verdict"] == "PASS")
+    total = len(results)
+    print(f"  整體: {pass_count}/{total} 通過自動 BPM 驗證")
 
     return results
 
@@ -165,10 +294,7 @@ def test_duplicate_generation():
     for i in range(1, 5):
         print(f"\n--- 第 {i}/4 次生成 ---")
         try:
-            interaction = client.interactions.create(
-                model=MODEL_PRO,
-                input=prompt,
-            )
+            interaction = create_with_retry(MODEL_PRO, prompt)
             files = save_interaction(interaction, f"dup_test_{i}")
             results.append({"run": i, "status": "OK", "files": files})
         except Exception as e:
@@ -248,13 +374,10 @@ def test_image_to_music():
         mime_type = mime_map.get(suffix, "image/png")
 
         try:
-            interaction = client.interactions.create(
-                model=MODEL_CLIP,
-                input=[
+            interaction = create_with_retry(MODEL_CLIP, [
                     {"type": "text", "text": prompt_text},
                     {"type": "image", "mime_type": mime_type, "data": base64_image},
-                ],
-            )
+                ])
             files = save_interaction(interaction, f"img_{img_path.stem}")
             results.append({
                 "image": img_path.name,
@@ -348,13 +471,10 @@ def test_nursery_rhyme():
         print(f"  歌詞: {case['prompt'][:80]}...")
 
         try:
-            interaction = client.interactions.create(
-                model=MODEL_CLIP,
-                input=[
+            interaction = create_with_retry(MODEL_CLIP, [
                     {"type": "text", "text": case["prompt"]},
                     {"type": "image", "mime_type": "image/jpeg", "data": base64_image},
-                ],
-            )
+                ])
             files = save_interaction(interaction, f"nursery_{case['name']}")
             results.append({
                 "name": case["name"],
