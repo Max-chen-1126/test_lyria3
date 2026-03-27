@@ -16,6 +16,7 @@
 | 模型（短 clip） | lyria-3-clip-preview（30 秒） |
 | Location | global |
 | 輸出格式 | MP3（44.1kHz / 192kbps） |
+| BPM 自動驗證 | ffmpeg 7.1.1 解碼 + librosa 0.11.0 beat_track |
 
 ---
 
@@ -23,7 +24,7 @@
 
 | 測試項目 | 結果 | 客戶痛點是否解決 |
 |----------|------|-----------------|
-| BPM 精準度 | 4/4 全部命中 | 是 |
+| BPM 精準度 | 3/4 通過自動驗證（±10% 容許範圍） | 是 |
 | 批次生成重複性 | 4 次皆不同 | 是 |
 | 圖片轉音樂（一般圖片） | 通過 | - |
 | 圖片轉音樂（專輯封面含藝人名） | 被阻擋（版權過濾） | 需注意 |
@@ -33,16 +34,18 @@
 
 ## 測試 1：BPM 與樂理 Prompt 精準度
 
-使用 `lyria-3-pro-preview` 生成，指定不同 BPM 與風格。
+使用 `lyria-3-pro-preview` 生成，指定不同 BPM 與風格。透過 **ffmpeg 解碼 + librosa beat_track** 自動偵測實際 BPM。
 
-| 目標 BPM | 模型回報 BPM | 時長 | 品質分數 | 風格 |
-|----------|-------------|------|---------|------|
-| 120 | 120.0 | 160.0s | 4.5 | Progressive House / Big Room EDM |
-| 85 | 85.0 | 158.2s | 4.5 | Lo-Fi Hip Hop |
-| 140 | 140.0 | 150.8s | 4.5 | Dark Trap |
-| 100 | 100.0 | 156.0s | 4.5 | Acoustic Folk Pop |
+| 目標 BPM | 模型回報 BPM | ffmpeg+librosa 偵測 BPM | 偏差 | 判定 | 風格 |
+|----------|-------------|------------------------|------|------|------|
+| 120 | 120.0 | N/A（API 空回應） | — | — | Progressive House / Big Room EDM |
+| 85 | 85.0 | 86.1 | +1.3% | PASS | Lo-Fi Hip Hop |
+| 140 | 140.0 | 143.6 | +2.6% | PASS | Dark Trap |
+| 100 | 100.0 | 99.4 | -0.6% | PASS | Acoustic Folk Pop |
 
-**結論：** Lyria 3 對 BPM 的遵循度極高，4 組全部精準命中目標值。風格描述也與 Prompt 高度吻合。
+> 容許偏差範圍：±10%，自動判定 PASS/FAIL。偵測流程：ffmpeg 將 MP3 轉為 22050 Hz mono WAV → librosa `beat_track` 分析節拍 → 支援半頻/倍頻自動修正。
+
+**結論：** 3/4 通過自動 BPM 驗證（BPM 120 因 API preview 階段空回應未能驗證，非 BPM 精準度問題）。成功偵測的 3 組偏差均在 ±3% 以內，遵循度極高。
 
 ---
 
